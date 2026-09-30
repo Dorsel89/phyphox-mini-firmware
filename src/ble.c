@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <hal/nrf_nvmc.h>
 #include <nrfx.h>
+#if defined(CONFIG_MCUBOOT_IMG_MANAGER)
+#include <zephyr/dfu/mcuboot.h>
+#endif
 
 struct bt_conn *last_connection;
 uint8_t config_data[20] = {0};
@@ -501,6 +504,19 @@ static void bt_ready(void)
 
 	if (adv_current == ADV_NORMAL) {
 		printk("Advertising successfully started\n\r");
+#if defined(CONFIG_MCUBOOT_IMG_MANAGER)
+		/* After an OTA update MCUboot boots the new image only on trial and
+		 * swaps back on the next reset unless it gets confirmed. Confirming
+		 * used to be left to the phone or the flasher over BLE, so a lost
+		 * connection at the wrong moment silently undid the update at the
+		 * next battery change. Confirm here: advertising works, so the fob
+		 * can take another update if this image turns out to be bad. An
+		 * image that crashes before this point still reverts. */
+		if (!boot_is_img_confirmed()) {
+			int rc = boot_write_img_confirmed();
+			printk("mcuboot: image confirmed (%d)\n\r", rc);
+		}
+#endif
 	}
 }
 

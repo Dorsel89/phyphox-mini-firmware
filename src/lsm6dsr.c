@@ -67,6 +67,10 @@ float get_gyr_si(int16_t lsb){
     }
     return 0.0f;
 }
+/* Acceleration in m/s^2 for every range. The float packet builder uses
+ * this as is - it used to multiply by 9.81 a second time, which made the
+ * 2/4/8 g values 9.81 times too large while 16 g (converted to g only)
+ * happened to come out right. */
 float get_acc_si(int16_t lsb){
     if(*lsm_range_acc == LSM6DSR_2g){
         return lsm6dsr_from_fs2g_to_mg(lsb)*9.81/1000.0;
@@ -75,7 +79,7 @@ float get_acc_si(int16_t lsb){
     }else if(*lsm_range_acc == LSM6DSR_8g){
         return lsm6dsr_from_fs8g_to_mg(lsb)*9.81/1000.0;
     }else if(*lsm_range_acc == LSM6DSR_16g){
-        return lsm6dsr_from_fs16g_to_mg(lsb)/1000.0;
+        return lsm6dsr_from_fs16g_to_mg(lsb)*9.81/1000.0;
     }
     return 0.0f;
 }
@@ -114,12 +118,15 @@ extern void send_data_lsm(struct k_work *work){
             for(int i = 0; i<lsm_data.event_number;i++){
                 data_float_format[i*4] = lsm_data.acc_time[i];
                 
-                data_float_format[i*4+1] = 9.81*get_acc_si(lsm_data.acc_array[i*3+0+2]);
-                data_float_format[i*4+2] = 9.81*get_acc_si(lsm_data.acc_array[i*3+1+2]);
-                data_float_format[i*4+3] = 9.81*get_acc_si(lsm_data.acc_array[i*3+2+2]);
+                data_float_format[i*4+1] = get_acc_si(lsm_data.acc_array[i*3+0+2]);
+                data_float_format[i*4+2] = get_acc_si(lsm_data.acc_array[i*3+1+2]);
+                data_float_format[i*4+3] = get_acc_si(lsm_data.acc_array[i*3+2+2]);
             }
             reset+=1;
-            send_data(SENSOR_LSM6DSR_ACC_ID, &data_float_format[0], 240);           
+            /* event_size*16, not a fixed 240: a constant length made every
+             * packet look like 15 samples, so anything the loop had not
+             * filled was decoded by the client as real measurements. */
+            send_data(SENSOR_LSM6DSR_ACC_ID, &data_float_format[0], lsm_data.event_size*16);           
         }
     }
     if(get_bit(*lsm_en,GYR_BIT)){
@@ -138,7 +145,10 @@ extern void send_data_lsm(struct k_work *work){
                 data_float_format[i*4+3] = get_gyr_si(lsm_data.gyr_array[i*3+2+2]);
             }
             reset+=1;
-            send_data(SENSOR_LSM6DSR_GYR_ID, &data_float_format[0], 240);           
+            /* event_size*16, not a fixed 240: a constant length made every
+             * packet look like 15 samples, so anything the loop had not
+             * filled was decoded by the client as real measurements. */
+            send_data(SENSOR_LSM6DSR_GYR_ID, &data_float_format[0], lsm_data.event_size*16);           
         }
     }
     if(reset){
@@ -236,6 +246,20 @@ static void platform_delay(uint32_t ms)
     k_msleep(ms);
 }
 
+/* The data-ready interrupt drives the whole readout, so it has to come from
+ * a sensor that is running. With the accelerometer off its DRDY never fires
+ * and gyro-only produced no data at all. With both on they share the ODR and
+ * send_data_lsm() reads both per interrupt, so one source is enough - INT1
+ * ORs the routed signals, and two near-simultaneous pulses would read some
+ * samples twice. */
+static void route_drdy(uint8_t en){
+    lsm6dsr_pin_int1_route_t route;
+    lsm6dsr_pin_int1_route_get(&dev_ctx, &route);
+    route.int1_ctrl.int1_drdy_xl = get_bit(en, ACC_BIT);
+    route.int1_ctrl.int1_drdy_g = !get_bit(en, ACC_BIT) && get_bit(en, GYR_BIT);
+    lsm6dsr_pin_int1_route_set(&dev_ctx, &route);
+}
+
 uint8_t enable_lsm(uint8_t en){
     pm_device_action_run(spispec.bus, PM_DEVICE_ACTION_RESUME);
     if(en == 0){
@@ -244,6 +268,7 @@ uint8_t enable_lsm(uint8_t en){
         pm_device_action_run(spispec.bus,PM_DEVICE_ACTION_SUSPEND);
         lsm_data.event_number = 0;
     }else{
+        route_drdy(en);
         if(get_bit(en,ACC_BIT)){
             printk("set acc rate to %i \r\n",*lsm_rate);
             lsm6dsr_xl_data_rate_set(&dev_ctx, *lsm_rate);
@@ -291,11 +316,7 @@ int8_t init_lsm(){
     configure_int();
     lsm6dsr_data_ready_mode_set(&dev_ctx,LSM6DSR_DRDY_PULSED);
 
-    //lsm6dsr_pin_int1_route_set(&dev_ctx,)
-    lsm6dsr_pin_int1_route_t int1_route;
-    lsm6dsr_pin_int1_route_get(&dev_ctx, &int1_route);
-    int1_route.int1_ctrl.int1_drdy_xl = PROPERTY_ENABLE;
-    lsm6dsr_pin_int1_route_set(&dev_ctx, &int1_route);
+    /* INT1 routing follows the enabled sensors, see route_drdy() */
 
     //int1_route.md1_cfg.int1_double_tap = PROPERTY_ENABLE;
     /* Disable I3C interface */

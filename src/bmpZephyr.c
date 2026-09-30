@@ -234,13 +234,33 @@ extern void bmp_read_once(float *pressure, float *temperature){
 }
 
 extern void send_data_bmp(struct k_work *work){
+    /* Take the edge time BEFORE the I2C read. At ~500 Hz a read on the
+     * 100 kHz bus takes about half a sample period, so the next DRDY edge
+     * regularly lands in the middle of it. Reading bmp_data.timestmap
+     * afterwards would stamp this sample with that newer edge - and the
+     * extra work run which that edge queued then writes the very same
+     * value again. Measured on a phyphox:mini: 0.33 % of all samples
+     * carried a duplicate timestamp this way, always inside one packet.
+     * irq_lock() also keeps the 64 bit value from being read half old and
+     * half new on this 32 bit core. */
+    unsigned int key = irq_lock();
+    int64_t sample_ticks = bmp_data.timestmap;
+    irq_unlock(key);
+
     uint8_t result = get_sensor_data(&osr_odr_press_cfg, &bmp581_dev);
     bmp5_error_codes_print_result("get_sensor_data", result);
-    printk("bmp: new reading pressure=%f hPa temperature=%f C\r\n",
-           bmp_data.pressure, bmp_data.temperature);
+    /* Hot path: runs ~500 times per second on the system workqueue stack,
+     * and formatting two %f with newlib costs both CPU time and a lot of
+     * stack. CONFIG_PRINTK ends up enabled even in the release build -
+     * NCS_BOOT_BANNER selects it - so without a guard the formatting is
+     * done and the result then dropped for lack of a console backend. */
+    if(DEBUG){
+        printk("bmp: new reading pressure=%f hPa temperature=%f C\r\n",
+               bmp_data.pressure, bmp_data.temperature);
+    }
 
     if(bmp_data.logging){
-        float currentime = bmp_data.timestmap/32768.0;
+        float currentime = sample_ticks/32768.0;
         printk("currently in logging mode, store data! seconds: %f\r\n",currentime);
         
         //skip if we are under x seconds since last save
@@ -262,7 +282,7 @@ extern void send_data_bmp(struct k_work *work){
 
         bmp_data.array[0+bmp_data.current_event*3]=bmp_data.pressure;
         bmp_data.array[1+bmp_data.current_event*3]=bmp_data.temperature;
-        bmp_data.array[2+bmp_data.current_event*3]=(bmp_data.timestmap/32768.0)-global_timestamp;
+        bmp_data.array[2+bmp_data.current_event*3]=(sample_ticks/32768.0)-global_timestamp;
 
         bmp_data.current_event++;
         if(bmp_data.current_event == bmp_data.max_events){

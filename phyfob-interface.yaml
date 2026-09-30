@@ -1,0 +1,672 @@
+# phyphox:mini (phyfob) - machine-readable BLE interface description
+#
+# Purpose: a single, tool-consumable source for
+#   * generating phyphox experiment files (incl. by LLMs),
+#   * driving the phyphox blockly editor's configuration UI
+#     (https://github.com/phyphox/phyphox-blockly-editor),
+#   * any third-party client that talks to the fob.
+#
+# Source of truth is the firmware in src/. Every value below is taken from
+# the code, not from README.md. Keep in sync with:
+#   src/ble.h            - UUIDs, GATT table
+#   src/bmpZephyr.c      - BMP581 config parsing, packet sizing
+#   src/lsm6dsr.c/.h     - LSM6DSR config parsing, packet layout
+#   src/hdc.c            - HDC1080 config parsing
+#   src/stcc4Zephyr.c/.h - STCC4 config parsing
+#   src/datalog.c/.h     - datalog commands, record layout
+#   src/event.c          - run control
+#
+spec_version: 1
+firmware_version: "1.1.0"
+
+device:
+  product_name: "phyphox:mini"
+  project_name: phyfob
+  soc: nRF52832
+  # bt_ready() in src/ble.c. Note the firmware appends a trailing newline to
+  # the name it passes to bt_set_name(); clients should strip trailing
+  # whitespace before displaying or matching it.
+  name:
+    prefix: "phyphox:mini "
+    default_pattern: "phyphox:mini <letter><2-digit serial>"   # from UICR 0x10001080
+    custom_pattern: "phyphox:mini <4 ASCII chars>"             # if a custom name was set
+  advertising:
+    # Advertising payload (connectable). Full device name is included.
+    service_uuids_16: ["0x180F"]                  # Battery Service
+    # Scan response.
+    scan_response_uuids_128:
+      - "8d53dc1d-1db7-4cd3-868b-8a527460aa84"    # MCUmgr SMP (used for FOTA)
+    intervals_ms:
+      idle: {min: 2000, max: 2100}
+      fast: {min: 50, max: 62.5}   # 10 s window after a disconnect
+  connection:
+    preferred_phy: "2M"
+    att_mtu: 247
+    max_notification_payload_bytes: 244
+
+conventions:
+  byte_order: little
+  types:
+    uint8:     {size: 1}
+    uint16le:  {size: 2}
+    int16le:   {size: 2}
+    uint32le:  {size: 4}
+    int32le:   {size: 4}
+    float32le: {size: 4}
+  # Every live sensor stream reports time as "seconds since the experiment was
+  # started", i.e. since 0x01 was written to control.run (see workflows).
+  timestamp:
+    reference: "control.run = start (0x01)"
+    unit: s
+  # Framing contract: a client never needs to know how many samples the
+  # firmware packed into a notification. It parses whatever arrived. Nothing
+  # in this spec below should be required to decode a packet.
+  framing:
+    rule: "frame_count = notification_length / frame.size_bytes"
+    notes: >
+      Sensor configuration characteristics are write-only (datalog is the only
+      exception), so a client that did not write the configuration itself
+      cannot read the packing back. Deriving the frame count from the
+      notification length is therefore the only generally correct approach,
+      and every stream in this spec supports it.
+
+# ---------------------------------------------------------------------------
+# GATT structure
+# ---------------------------------------------------------------------------
+services:
+  - id: sensor_data
+    uuid: "cddf1001-30f7-4671-8b43-5e40ba53514a"
+    description: >
+      Primary service carrying all sensor data and per-sensor configuration.
+      Note: the service UUID is identical to the accelerometer data
+      characteristic UUID (cddf1001). This is how the firmware is written, but
+      it means clients must not identify characteristics by UUID alone without
+      also checking the attribute type.
+  - id: run_control
+    uuid: "cddf0001-30f7-4671-8b43-5e40ba53514a"
+    description: Experiment start/stop control.
+  - id: battery
+    uuid: "0000180f-0000-1000-8000-00805f9b34fb"
+    description: Standard Battery Service, coin cell level in percent.
+  - id: device_information
+    uuid: "0000180a-0000-1000-8000-00805f9b34fb"
+    description: >
+      Standard Device Information Service. Firmware Revision String (0x2A26)
+      carries the app version from the VERSION file, e.g. "1.1.0+0".
+      Manufacturer Name String (0x2A29) is "phyphox:tools", Model Number String
+      (0x2A24) is "mini".
+
+# ---------------------------------------------------------------------------
+# Sensors
+# ---------------------------------------------------------------------------
+sensors:
+
+  bmp581:
+    label: "BMP581 (pressure, temperature)"
+    part_number: BMP581
+    datasheet: https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp581-ds004.pdf
+    data:
+      characteristic: "cddf1007-30f7-4671-8b43-5e40ba53514a"
+      properties: [read, notify]
+      frame:
+        size_bytes: 12
+        fields:
+          - {name: pressure,    offset: 0, type: float32le, unit: hPa,  quantity: pressure}
+          - {name: temperature, offset: 4, type: float32le, unit: degC, quantity: temperature}
+          - {name: t,           offset: 8, type: float32le, unit: s,    quantity: time, role: timestamp}
+      repetition:
+        rule: "frame_count = notification_length / 12"
+        max_frames: 10
+        notes: >
+          Informational only, not needed to decode a packet: the firmware packs
+          more samples per notification at low oversampling so that slow rates
+          still feel live - 1x: 10 frames, 2x: 6, 4x: 4, 8x: 3, 16x: 2,
+          32x and above: 1. Useful for estimating the notification rate.
+    config:
+      characteristic: "cddf1008-30f7-4671-8b43-5e40ba53514a"
+      properties: [write, notify]
+      fields:
+        - name: enable
+          offset: 0
+          type: uint8
+          default: 1
+          values:
+            - {value: 0x00, label: "off"}
+            - {value: 0x01, label: "on"}
+            - {value: 0x03, label: "start internal logging", status: legacy}
+            - {value: 0x04, label: "dump internal log", status: legacy}
+          notes: >
+            0x03/0x04 are the pre-datalog-module RAM logging path. New clients
+            should use the datalog control characteristic instead.
+        - name: oversampling_p
+          offset: 1
+          type: uint8
+          default: 0x00
+          label: "pressure oversampling"
+          values:
+            - {value: 0x00, label: "1x",   factor: 1}
+            - {value: 0x01, label: "2x",   factor: 2}
+            - {value: 0x02, label: "4x",   factor: 4}
+            - {value: 0x03, label: "8x",   factor: 8}
+            - {value: 0x04, label: "16x",  factor: 16}
+            - {value: 0x05, label: "32x",  factor: 32}
+            - {value: 0x06, label: "64x",  factor: 64}
+            - {value: 0x07, label: "128x", factor: 128}
+        - name: iir
+          offset: 2
+          type: uint8
+          default: 0x01
+          label: "IIR filter"
+          values:
+            - {value: 0x00, label: "bypass",          coefficient: 0}
+            - {value: 0x01, label: "coefficient 1",   coefficient: 1}
+            - {value: 0x02, label: "coefficient 3",   coefficient: 3}
+            - {value: 0x03, label: "coefficient 7",   coefficient: 7}
+            - {value: 0x04, label: "coefficient 15",  coefficient: 15}
+            - {value: 0x05, label: "coefficient 31",  coefficient: 31}
+            - {value: 0x06, label: "coefficient 63",  coefficient: 63}
+            - {value: 0x07, label: "coefficient 127", coefficient: 127}
+
+  lsm6dsr_accelerometer:
+    label: "LSM6DSR accelerometer"
+    part_number: LSM6DSR
+    datasheet: https://www.st.com/resource/en/datasheet/lsm6dsr.pdf
+    config_ref: lsm6dsr_shared_config
+    data:
+      characteristic: "cddf1001-30f7-4671-8b43-5e40ba53514a"
+      properties: [read, notify]
+      # The wire layout depends on the shared "format" config field.
+      formats:
+        float:
+          selector: {field: format, value: 0}
+          frame:
+            size_bytes: 16
+            fields:
+              - {name: t, offset:  0, type: float32le, unit: s,       quantity: time, role: timestamp}
+              - {name: x, offset:  4, type: float32le, unit: "m/s^2", quantity: acceleration}
+              - {name: y, offset:  8, type: float32le, unit: "m/s^2", quantity: acceleration}
+              - {name: z, offset: 12, type: float32le, unit: "m/s^2", quantity: acceleration}
+          notification_length_bytes: "16 * event_size"
+          notes: >
+            Follows conventions.framing. event_size must not exceed 15 in this
+            format - see the constraint on the config field.
+          known_issues:
+            - id: acc-float-scaling
+              severity: high
+              status: fixed
+              description: >
+                Firmware before the scaling fix scales the 2g, 4g and 8g ranges
+                by 9.81 twice (get_acc_si() already converted mg to m/s^2, and
+                send_data_lsm() multiplied by 9.81 again), so readings are a
+                factor of 9.81 too large there. The 16g range is correct on every
+                version. With the fix all ranges deliver m/s^2. A client that must
+                also work with older firmware can use 16g.
+        int16:
+          selector: {field: format, value: 1}
+          header:
+            size_bytes: 4
+            fields:
+              - {name: t0, offset: 0, type: float32le, unit: s, role: timestamp,
+                 description: "timestamp of the first sample in this packet"}
+          frame:
+            size_bytes: 6
+            fields:
+              - {name: x, offset: 0, type: int16le, unit: LSB, quantity: acceleration}
+              - {name: y, offset: 2, type: int16le, unit: LSB, quantity: acceleration}
+              - {name: z, offset: 4, type: int16le, unit: LSB, quantity: acceleration}
+          notification_length_bytes: "4 + 6 * event_size"
+          notes: >
+            Raw sensor LSBs; the client must apply the scale factor for the
+            configured range. Only the first sample carries a timestamp; the
+            remaining samples are spaced by 1/rate.
+          scale_factors_m_per_s2_per_lsb:
+            0x00: 0.000598    # 2g   (0.061 mg/LSB * 9.81 / 1000)
+            0x02: 0.001197    # 4g   (0.122 mg/LSB)
+            0x03: 0.002394    # 8g   (0.244 mg/LSB)
+            0x01: 0.004788    # 16g  (0.488 mg/LSB)
+
+  lsm6dsr_gyroscope:
+    label: "LSM6DSR gyroscope"
+    part_number: LSM6DSR
+    config_ref: lsm6dsr_shared_config
+    data:
+      characteristic: "cddf1000-30f7-4671-8b43-5e40ba53514a"
+      properties: [read, notify]
+      formats:
+        float:
+          selector: {field: format, value: 0}
+          frame:
+            size_bytes: 16
+            fields:
+              - {name: t, offset:  0, type: float32le, unit: s,       quantity: time, role: timestamp}
+              - {name: x, offset:  4, type: float32le, unit: "deg/s", quantity: angular_velocity}
+              - {name: y, offset:  8, type: float32le, unit: "deg/s", quantity: angular_velocity}
+              - {name: z, offset: 12, type: float32le, unit: "deg/s", quantity: angular_velocity}
+          notification_length_bytes: "16 * event_size"
+          notes: >
+            Follows conventions.framing. event_size must not exceed 15 in this
+            format - see the constraint on the config field. Unlike the
+            accelerometer, the gyroscope scaling is correct.
+        int16:
+          selector: {field: format, value: 1}
+          header:
+            size_bytes: 4
+            fields:
+              - {name: t0, offset: 0, type: float32le, unit: s, role: timestamp}
+          frame:
+            size_bytes: 6
+            fields:
+              - {name: x, offset: 0, type: int16le, unit: LSB, quantity: angular_velocity}
+              - {name: y, offset: 2, type: int16le, unit: LSB, quantity: angular_velocity}
+              - {name: z, offset: 4, type: int16le, unit: LSB, quantity: angular_velocity}
+          notification_length_bytes: "4 + 6 * event_size"
+          scale_factors_deg_per_s_per_lsb:
+            0x02: 0.004375   # 125 dps
+            0x00: 0.00875    # 250 dps
+            0x04: 0.0175     # 500 dps
+            0x08: 0.035      # 1000 dps
+            0x0C: 0.07       # 2000 dps
+            0x01: 0.14       # 4000 dps
+
+  lsm6dsr_shared_config:
+    label: "LSM6DSR configuration (accelerometer + gyroscope)"
+    applies_to: [lsm6dsr_accelerometer, lsm6dsr_gyroscope]
+    config:
+      characteristic: "cddf1002-30f7-4671-8b43-5e40ba53514a"
+      properties: [write, notify]
+      fields:
+        - name: enable
+          offset: 0
+          type: uint8
+          kind: bitmask
+          default: 0x00
+          bits:
+            - {bit: 0, mask: 0x01, label: "accelerometer"}
+            - {bit: 1, mask: 0x02, label: "gyroscope"}
+          notes: "0x03 enables both. 0x00 powers the sensor down."
+        - name: rate
+          offset: 1
+          type: uint8
+          label: "output data rate"
+          unit: Hz
+          notes: "Applies to accelerometer and gyroscope alike."
+          values:
+            - {value: 0x01, label: "12.5 Hz", hz: 12.5}
+            - {value: 0x02, label: "26 Hz",   hz: 26}
+            - {value: 0x03, label: "52 Hz",   hz: 52}
+            - {value: 0x04, label: "104 Hz",  hz: 104}
+            - {value: 0x05, label: "208 Hz",  hz: 208}
+            - {value: 0x06, label: "416 Hz",  hz: 416}
+            - {value: 0x07, label: "833 Hz",  hz: 833}
+            - {value: 0x08, label: "1666 Hz", hz: 1666}
+            - {value: 0x09, label: "3332 Hz", hz: 3332}
+            - {value: 0x0A, label: "6667 Hz", hz: 6667}
+        - name: range_acc
+          offset: 2
+          type: uint8
+          label: "accelerometer full scale"
+          values:
+            - {value: 0x00, label: "2 g",  g: 2}
+            - {value: 0x02, label: "4 g",  g: 4}
+            - {value: 0x03, label: "8 g",  g: 8}
+            - {value: 0x01, label: "16 g", g: 16}
+        - name: range_gyr
+          offset: 3
+          type: uint8
+          label: "gyroscope full scale"
+          values:
+            - {value: 0x02, label: "125 dps",  dps: 125}
+            - {value: 0x00, label: "250 dps",  dps: 250}
+            - {value: 0x04, label: "500 dps",  dps: 500}
+            - {value: 0x08, label: "1000 dps", dps: 1000}
+            - {value: 0x0C, label: "2000 dps", dps: 2000}
+            - {value: 0x01, label: "4000 dps", dps: 4000}
+        - name: format
+          offset: 4
+          type: uint8
+          label: "data format"
+          default: 0
+          values:
+            - {value: 0, label: "float32 (SI units, timestamp per sample)"}
+            - {value: 1, label: "int16 (raw LSB, one timestamp per packet)"}
+        - name: event_size
+          offset: 5
+          type: uint8
+          label: "samples per BLE packet"
+          minimum: 1
+          maximum_by_format:
+            0: 15   # float: the packet buffer holds 15 frames
+            1: 40   # int16: 4 + 6*40 = 244 bytes, the ATT payload limit
+          notes: >
+            A latency/throughput knob only: larger packets mean fewer BLE
+            events but coarser time granularity. Decoding never depends on it -
+            in both formats the frame count follows from the notification
+            length (conventions.framing). The firmware does not range-check
+            this field in either format: a larger value overruns its packet
+            buffer, so clients and editors must offer only the range above.
+
+  hdc1080:
+    label: "HDC1080 (temperature, humidity)"
+    part_number: HDC1080
+    datasheet: https://www.ti.com/lit/gpn/hdc1080
+    data:
+      characteristic: "cddf1005-30f7-4671-8b43-5e40ba53514a"
+      properties: [read, notify]
+      frame:
+        size_bytes: 12
+        fields:
+          - {name: temperature, offset: 0, type: float32le, unit: degC,  quantity: temperature}
+          - {name: humidity,    offset: 4, type: float32le, unit: "%RH", quantity: relative_humidity}
+          - {name: t,           offset: 8, type: float32le, unit: s,     quantity: time, role: timestamp}
+      repetition:
+        rule: single_frame
+    config:
+      characteristic: "cddf1006-30f7-4671-8b43-5e40ba53514a"
+      properties: [write, notify]
+      fields:
+        - name: enable
+          offset: 0
+          type: uint8
+          values:
+            - {value: 0x00, label: "off"}
+            - {value: 0x01, label: "on"}
+        - name: interval
+          offset: 1
+          type: uint8
+          label: "measurement interval"
+          encoding: {multiply_by: 100, unit: ms}
+          minimum_ms: 300
+          maximum_ms: 25500
+          notes: >
+            interval_ms = value * 100, clamped to a minimum of 300 ms.
+            Example: 0x0A = 1000 ms.
+
+  stcc4:
+    label: "STCC4 (CO2)"
+    part_number: STCC4
+    datasheet: https://sensirion.com/resource/datasheet/STCC4
+    data:
+      characteristic: "cddf100b-30f7-4671-8b43-5e40ba53514a"
+      properties: [read, notify]
+      frame:
+        size_bytes: 8
+        fields:
+          - {name: co2, offset: 0, type: float32le, unit: ppm, quantity: co2_concentration}
+          - {name: t,   offset: 4, type: float32le, unit: s,   quantity: time, role: timestamp}
+      repetition:
+        rule: single_frame
+    config:
+      characteristic: "cddf100c-30f7-4671-8b43-5e40ba53514a"
+      properties: [write, notify]
+      fields:
+        - name: enable
+          offset: 0
+          type: uint8
+          values:
+            - {value: 0x00, label: "off"}
+            - {value: 0x01, label: "on"}
+            - {value: 0x02, label: "forced recalibration"}
+          notes: >
+            0x02 starts a forced recalibration: the sensor measures for 30 s at
+            a 1 s interval, then applies the reference value from byte 1.
+        - name: interval
+          offset: 1
+          type: uint8
+          label: "measurement interval"
+          encoding: {multiply_by: 100, unit: ms}
+          minimum_ms: 1000
+          maximum_ms: 25500
+          notes: >
+            interval_ms = value * 100, clamped to a minimum of 1000 ms. The
+            sensor produces one result per second in continuous mode. If a
+            read yields no result, no notification is sent (older firmware
+            sent 0 ppm instead and allowed intervals down to 100 ms).
+          alternate_meaning:
+            when: {field: enable, value: 0x02}
+            label: "reference CO2 concentration"
+            encoding: {multiply_by: 10, unit: ppm}
+            notes: "e.g. 42 = 420 ppm ambient"
+
+  battery:
+    label: "Coin cell level"
+    data:
+      characteristic: "00002a19-0000-1000-8000-00805f9b34fb"
+      properties: [read, notify]
+      frame:
+        size_bytes: 1
+        fields:
+          - {name: level, offset: 0, type: uint8, unit: "%", quantity: battery_level}
+
+# ---------------------------------------------------------------------------
+# Control characteristics (not sensors)
+# ---------------------------------------------------------------------------
+control:
+
+  run:
+    label: "Experiment run control"
+    characteristic: "cddf0004-30f7-4671-8b43-5e40ba53514a"
+    service: run_control
+    properties: [write, notify]
+    critical: true
+    description: >
+      Gates every sensor notification. While no start command has been sent the
+      firmware drops all notifications, so a client that only enables CCCDs and
+      writes sensor configs will receive nothing. Write 0x01 last, after all
+      sensor configuration.
+    fields:
+      - name: command
+        offset: 0
+        type: uint8
+        values:
+          - {value: 0x00, label: "pause", implemented: false}
+          - value: 0x01
+            label: "start"
+            implemented: true
+            description: >
+              Resets the time reference and enables notifications. Only takes
+              effect if the device is in the reset state (fresh connection, or
+              after a clear).
+          - value: 0x02
+            label: "clear"
+            implemented: true
+            description: "Stops notifications and arms the next start."
+          - {value: 0xFF, label: "sync", implemented: false}
+
+  datalog:
+    label: "Standalone data logging (device not connected)"
+    description: >
+      Periodically samples the selected sensors into a 1 MB ring buffer in
+      external flash and, optionally, broadcasts the latest values as BTHome v2
+      advertisements. Settings survive a battery change.
+    data:
+      characteristic: "cddf1010-30f7-4671-8b43-5e40ba53514a"
+      properties: [read, notify]
+      description: >
+        Dump output. Records are packed back to back and split across
+        notifications of at most 244 bytes; a record is never split across two
+        notifications. Record size depends on the sensor mask that was active
+        while logging.
+      record:
+        size_bytes: "4 + 4 * popcount(mask)"
+        fields:
+          - name: t
+            offset: 0
+            type: int32le
+            unit: s
+            role: timestamp
+            description: >
+              Seconds relative to the experiment start; negative for records
+              logged before it.
+          - {name: co2,         type: float32le, unit: ppm,   present_if_mask_bit: 0x01, order: 1}
+          - {name: temperature, type: float32le, unit: degC,  present_if_mask_bit: 0x02, order: 2}
+          - {name: humidity,    type: float32le, unit: "%RH", present_if_mask_bit: 0x04, order: 3}
+          - {name: pressure,    type: float32le, unit: hPa,   present_if_mask_bit: 0x08, order: 4}
+        notes: >
+          Present fields follow the mask bit order above, immediately after the
+          timestamp. Absent sensors occupy no bytes.
+    config:
+      characteristic: "cddf1011-30f7-4671-8b43-5e40ba53514a"
+      properties: [read, write, notify]
+      write:
+        description: >
+          A command frame. The firmware only acts once byte 0 is written, so
+          write bytes 1..3 first and byte 0 last (a single 4-byte write also
+          works).
+        fields:
+          - name: command
+            offset: 0
+            type: uint8
+            values:
+              - {value: 0x00, label: "stop"}
+              - {value: 0x01, label: "start"}
+              - {value: 0x02, label: "dump"}
+              - {value: 0x03, label: "erase"}
+              - {value: 0x04, label: "BTHome advertising"}
+          - name: mask
+            offset: 1
+            type: uint8
+            kind: bitmask
+            label: "sensors to log"
+            used_by: [0x01]
+            bits:
+              - {bit: 0, mask: 0x01, label: "CO2",         sensor: stcc4}
+              - {bit: 1, mask: 0x02, label: "temperature", sensor: hdc1080}
+              - {bit: 2, mask: 0x04, label: "humidity",    sensor: hdc1080}
+              - {bit: 3, mask: 0x08, label: "pressure",    sensor: bmp581}
+            notes: "Changing the mask erases the existing log."
+          - name: param
+            offset: 2
+            type: uint16le
+            label: "command parameter"
+            meaning_by_command:
+              0x00: {label: "unused"}
+              0x01: {label: "logging interval", unit: s, default_if_zero: 30}
+              0x02: {label: "maximum record age to send", unit: min,
+                     notes: "0 = send the whole log"}
+              0x03: {label: "unused"}
+              0x04: {label: "BTHome enable", notes: "0 = off, anything else = on"}
+      read:
+        description: >
+          The configuration actually in effect, including settings restored
+          from flash after a battery change.
+        fields:
+          - {name: running,  offset: 0, type: uint8,    description: "1 = logging, 0 = stopped (matches the start/stop command value)"}
+          - {name: mask,     offset: 1, type: uint8,    kind: bitmask}
+          - {name: interval, offset: 2, type: uint16le, unit: s}
+          - {name: bthome,   offset: 4, type: uint8,    description: "1 = BTHome advertising enabled"}
+    storage:
+      backend: external SPI NOR flash
+      partition: datalog
+      size_bytes: 1048576
+      slot_size_bytes: 32
+      capacity_records: 32736
+      notes: >
+        The ring buffer is erased on every boot; only the settings survive.
+        Timestamps stored in flash are seconds since boot and are converted to
+        experiment-relative time at dump time.
+
+  device_settings:
+    label: "Connection parameters and device name"
+    characteristic: "cddf1022-30f7-4671-8b43-5e40ba53514a"
+    properties: [write, notify]
+    commands:
+      - name: connection_parameters
+        selector: {offset: 0, value: 0x01}
+        fields:
+          - {name: interval_min, offset: 1, type: uint8, unit: "1.25 ms"}
+          - {name: interval_max, offset: 2, type: uint8, unit: "1.25 ms"}
+          - {name: latency,      offset: 3, type: uint8}
+          - {name: timeout,      offset: 4, type: uint8, unit: "10 ms"}
+        notes: >
+          Each parameter is a single byte, so the usable interval range is
+          limited to 0..255 units. Applied about 200 ms after the write.
+      - name: custom_name
+        selector: {offset: 0, value: 0x02}
+        fields:
+          - name: name
+            offset: 1
+            type: uint32le
+            description: "4 ASCII characters, least significant byte shown last"
+        notes: >
+          Writes the name to UICR and immediately reboots the device, dropping
+          the connection. Persistent across firmware updates.
+
+  bthome:
+    label: "BTHome v2 advertising"
+    description: >
+      Enabled through datalog command 0x04. After each datalog sample the fob
+      switches its advertising payload to a BTHome v2 packet for 10 s so that
+      receivers which never connect (e.g. Home Assistant) pick up the values.
+    format: https://bthome.io/format/
+    service_data_uuid16: "0xFCD2"
+    device_info_byte: 0x40   # unencrypted, regular intervals, BTHome v2
+    objects:
+      - {id: 0x00, name: packet_id,   type: uint8}
+      - {id: 0x02, name: temperature, type: int16le,  factor: 0.01, unit: degC}
+      - {id: 0x03, name: humidity,    type: uint16le, factor: 0.01, unit: "%RH"}
+      - {id: 0x04, name: pressure,    type: uint24le, factor: 0.01, unit: hPa}
+      - {id: 0x12, name: co2,         type: uint16le, factor: 1,    unit: ppm}
+    notes: >
+      Only the sensors in the active datalog mask are included, in ascending
+      object id order. The device name is dropped from the advertising payload
+      for the duration of a burst.
+
+  firmware_update:
+    label: "Firmware update (FOTA)"
+    transport: MCUmgr SMP over BLE
+    service_uuid: "8d53dc1d-1db7-4cd3-868b-8a527460aa84"
+    notes: >
+      Standard mcumgr image upload. The image must be marked for test or
+      confirmed before it is applied; the firmware does not self-confirm, so an
+      image that is only tested reverts on the next reboot.
+
+# ---------------------------------------------------------------------------
+# How to actually run a measurement
+# ---------------------------------------------------------------------------
+workflows:
+
+  live_measurement:
+    description: Stream sensor data to a connected client (the phyphox use case).
+    steps:
+      - {action: connect,   target: device}
+      - {action: subscribe, target: "<sensor>.data", note: "write 0x0001 to the CCCD"}
+      - {action: write,     target: "<sensor>.config", note: "enable = 1 plus the sensor's parameters"}
+      - {action: write,     target: control.run, value: 0x01,
+         note: "MUST be last - no notifications are sent before this"}
+      - {action: receive,   target: "<sensor>.data"}
+      - {action: write,     target: control.run, value: 0x02, note: "stop"}
+    pitfalls:
+      - "Writing control.run = 0x01 before the sensor configs still works, but the time reference is then set before the sensors start."
+      - "control.run = 0x01 is ignored unless the device is in the reset state; send 0x02 first when restarting within one connection."
+      - "On disconnect the firmware powers all sensors down and re-arms the reset state."
+
+  standalone_logging:
+    description: Log without a phone present, then collect the data later.
+    steps:
+      - {action: connect,    target: device}
+      - {action: write,      target: datalog.config,
+         note: "bytes 1..3 first (mask, interval), then byte 0 = 0x01"}
+      - {action: disconnect, note: "logging only runs while no client is connected"}
+      - {action: connect,    target: device, note: "later"}
+      - {action: subscribe,  target: datalog.data}
+      - {action: write,      target: control.run, value: 0x01}
+      - {action: write,      target: datalog.config,
+         note: "bytes 2..3 = max age in minutes, then byte 0 = 0x02 (dump)"}
+      - {action: receive,    target: datalog.data,
+         note: "parse records using the mask read back from datalog.config"}
+    pitfalls:
+      - "Read datalog.config first to learn the mask actually in use - it may have been restored from flash rather than set this session."
+      - "Starting with a different mask erases the existing log."
+
+# ---------------------------------------------------------------------------
+# Known deviations of README.md from the firmware, as of this spec version.
+# Listed so tooling built on the old README can be migrated deliberately.
+# ---------------------------------------------------------------------------
+readme_corrections:
+  - {topic: bmp581_uuids,        readme: "cddf1013 / cddf1014",                  firmware: "cddf1007 / cddf1008"}
+  - {topic: hdc1080_interval,    readme: "multiples of 10 ms, minimum 30 ms",    firmware: "multiples of 100 ms, minimum 300 ms"}
+  - {topic: stcc4_interval,      readme: "multiples of 1 s, minimum 1 s",        firmware: "multiples of 100 ms, minimum 100 ms"}
+  - {topic: stcc4_frame_size,    readme: "12 bytes",                             firmware: "8 bytes"}
+  - {topic: lsm6dsr_float_order, readme: "x, y, z, timestamp",                   firmware: "timestamp, x, y, z"}
+  - {topic: lsm6dsr_rate_0x07,   readme: "816 Hz",                               firmware: "833 Hz"}
+  - {topic: missing,             readme: "not documented",                       firmware: "run control, datalog, device settings, BTHome, battery and device information services"}

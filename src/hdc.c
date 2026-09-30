@@ -3,13 +3,19 @@
 
 extern bool init_hdc()
 {
+    /* Register the work items and the timer before anything can fail.
+     * They only store function pointers, no hardware is touched. If the
+     * sensor does not answer we still leave this function early, but a
+     * later configuration write then finds an initialised work item
+     * instead of queueing a NULL handler and faulting the whole fob. */
+    k_work_init(&work_hdc, send_data_hdc);
+	k_work_init(&config_work_hdc, set_config_hdc);
+    k_timer_init(&timer_hdc, hdc_data_ready, NULL);
+
     if(!device_is_ready(hdc_dev)){
         printk("Device not ready or not found");
         return false;
     }
-    k_work_init(&work_hdc, send_data_hdc);
-	k_work_init(&config_work_hdc, set_config_hdc);
-    k_timer_init(&timer_hdc, hdc_data_ready, NULL);
     /* The datalog module now triggers every sensor's measurement directly
      * (see datalog_tick()) at its own configured interval, so this legacy
      * independently-timed background timer must stay stopped - starting it

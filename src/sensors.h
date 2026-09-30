@@ -5,7 +5,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/sensor.h>
 
-#define DEBUG				true
+#define DEBUG				false
 #define PRINT_SENSOR_DATA 	true
 
 #define SENSOR_BMP581_ID		1

@@ -18,6 +18,9 @@ static void calibration_work(struct k_work *work)
 }
 K_WORK_DELAYABLE_DEFINE(stcc4_calibration_work, calibration_work);
 
+/* Continuous mode delivers one result per second */
+#define STCC4_MIN_INTERVAL_MS 1000
+
 void set_config_stcc4(struct k_work *work)
 {
     sleep_stcc4(true);
@@ -27,7 +30,7 @@ void set_config_stcc4(struct k_work *work)
     {
         printk("start stcc4 calibration \r\n");
         //measure for 30s
-        stcc4_data.timer_interval = 100;
+        stcc4_data.timer_interval = STCC4_MIN_INTERVAL_MS;
         sleep_stcc4(false);
         k_work_schedule(&stcc4_calibration_work,K_SECONDS(30));
         return;
@@ -36,13 +39,25 @@ void set_config_stcc4(struct k_work *work)
     stcc4_data.timer_interval = stcc4_data.config[1]*100;
     printk("stcc4 config received \n");
     printk("stcc4 interval: %i\n",stcc4_data.timer_interval);
-    //Ensure minimum of ? ms
-    if (stcc4_data.timer_interval < 100) {stcc4_data.timer_interval = 100;}
+    /* The sensor produces one result per second in continuous mode. Reading
+     * faster only returns "no new data" errors, which used to go out as 0 ppm. */
+    if (stcc4_data.timer_interval < STCC4_MIN_INTERVAL_MS) {
+        stcc4_data.timer_interval = STCC4_MIN_INTERVAL_MS;
+    }
     sleep_stcc4(!stcc4_data.config[0]);
 }
 
 extern int8_t init_stcc4(){
     stcc4_data.enable = &stcc4_data.config[0];
+    /* Register the work items and the timer before anything can fail.
+     * They only store function pointers, no hardware is touched. If the
+     * sensor does not answer we still leave this function early, but a
+     * later configuration write then finds an initialised work item
+     * instead of queueing a NULL handler and faulting the whole fob. */
+    k_work_init(&work_stcc4, send_data_stcc4);
+	k_work_init(&config_work_stcc4, set_config_stcc4);
+    k_timer_init(&timer_stcc4, stcc4_data_ready, NULL);
+
     if(!device_is_ready(stcc4_dev)){
         printk("Device stcc4_dev not ready or not found");
         return false;
@@ -69,9 +84,6 @@ extern int8_t init_stcc4(){
             return error;
     }
 
-    k_work_init(&work_stcc4, send_data_stcc4);
-	k_work_init(&config_work_stcc4, set_config_stcc4);
-    k_timer_init(&timer_stcc4, stcc4_data_ready, NULL);
     /* The datalog module now triggers every sensor's measurement directly
      * (see datalog_tick()) at its own configured interval, so this legacy
      * independently-timed background timer must stay stopped - starting it
@@ -163,11 +175,17 @@ void send_data_stcc4(struct k_work *work)
 
     }else{
         //phyphox live mode
-        stcc4_read_measurement_raw(
+        int16_t error = stcc4_read_measurement_raw(
             &co2_concentration_raw, &temperature_raw, &relative_humidity_raw,
             &sensor_status_raw);
         
         printk("stcc4 live mode \r\n");
+        /* No result (not ready yet, or the read failed): send nothing rather
+         * than a 0 ppm reading that looks like a real measurement. */
+        if (error != NO_ERROR) {
+            printk("stcc4: read failed (%i), nothing sent\r\n", error);
+            return;
+        }
     }
     stcc4_data.co2 = co2_concentration_raw;
     stcc4_data.array[0]=stcc4_data.co2;

@@ -1,3 +1,4 @@
 build*/
 debugging*/
 .claude/settings.json
+__pycache__*/
