@@ -1,6 +1,6 @@
 #include "event.h"
 
-extern bool RESETTED = true;
+bool RESETTED = true;
 
 extern void phyphox_event_received(){
     printk("PHYPHOX EVENTHANDLER\r\n");

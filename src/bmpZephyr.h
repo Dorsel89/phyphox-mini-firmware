@@ -25,9 +25,9 @@ extern int8_t init_bmp();
 extern void submit_config_bmp();
 extern uint8_t sleep_bmp(bool SLEEP);
 extern uint8_t bmp_loggingmode();
+extern void bmp_read_once(float *pressure, float *temperature);
 
 static void start_logging();
-static void stop_logging();
 
 // ----------------
 // Driver variables

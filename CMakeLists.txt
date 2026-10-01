@@ -20,6 +20,7 @@ target_sources(app PRIVATE src/lsm6dsr.c)
 target_sources(app PRIVATE src/lsm6dsr_reg.c)
 
 target_sources(app PRIVATE src/stcc4Zephyr.c)
+target_sources(app PRIVATE src/datalog.c)
 target_sources(app PRIVATE src/sensirion_i2c.c)
 target_sources(app PRIVATE src/stcc4_i2c.c)
 target_sources(app PRIVATE src/sensirion_i2c_hal.c)

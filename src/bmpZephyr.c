@@ -1,22 +1,16 @@
 #include "bmpZephyr.h"
+#include "ble.h"
 
 static uint8_t dev_addr;
 static struct bmp5_osr_odr_press_config osr_odr_press_cfg = { 0 };
 
 BMP5_INTF_RET_TYPE bmp5_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t length, void *intf_ptr)
 {
-    uint8_t device_addr = *(uint8_t*)intf_ptr;
-
-    (void)intf_ptr;
     return i2c_burst_read(intf_ptr,BMP581_I2C_ADDR,reg_addr,reg_data,length);
 }
 
 BMP5_INTF_RET_TYPE bmp5_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t length, void *intf_ptr)
 {
-    uint8_t device_addr = *(uint8_t*)intf_ptr;
-
-    (void)intf_ptr;
-
     return i2c_burst_write(intf_ptr,BMP581_I2C_ADDR,reg_addr,reg_data,length);
 }
 
@@ -70,10 +64,20 @@ void bmp5_error_codes_print_result(const char api_name[], int8_t rslt)
 static const struct gpio_dt_spec bmpInt = GPIO_DT_SPEC_GET_OR(BMP_INT, gpios,{0});
 static struct gpio_callback bmpInt_cb_data;
 
+/* Given by bmpDataReady() on every DRDY edge, consumed by bmp_read_once() to
+ * wait for the actual conversion instead of a fixed guess. */
+static struct k_sem bmp_drdy_sem;
+/* Set while bmp_read_once() is waiting for its own forced-mode DRDY, so the
+ * unrelated live-streaming work item isn't submitted for that same edge. */
+static volatile bool bmp_datalog_read_pending;
+
 static void bmpDataReady(const struct device *dev, struct gpio_callback *cb,uint32_t pins)
 {
     bmp_data.timestmap = k_uptime_ticks();
-	k_work_submit(&work_bmp);
+	k_sem_give(&bmp_drdy_sem);
+	if (!bmp_datalog_read_pending) {
+		k_work_submit(&work_bmp);
+	}
 }
 
 static int8_t set_config(struct bmp5_osr_odr_press_config *osr_odr_press_cfg, struct bmp5_dev *dev)
@@ -194,16 +198,69 @@ static void start_logging(){
     LOG.last_save=0;
     bmp_data.logging = true;
 }
-static void stop_logging(){
-    bmp_data.logging = false;
+/* Synchronous single-shot read for the datalog module: trigger a forced-
+ * mode conversion and wait for the sensor's own DRDY interrupt instead of a
+ * fixed guessed delay - this adapts automatically to whatever the actual
+ * oversampling setting requires and never reads stale data if a conversion
+ * happens to take longer than expected. The timeout is just a safety net in
+ * case the interrupt is ever missed. Called right at datalog-tick time so
+ * the logged value is as fresh as possible, instead of relying on a
+ * separately-timed background sample that may be stale by up to a full
+ * interval. */
+extern void bmp_read_once(float *pressure, float *temperature){
+    k_sem_reset(&bmp_drdy_sem);
+    bmp_datalog_read_pending = true;
+
+    int8_t rslt = bmp5_set_power_mode(BMP5_POWERMODE_FORCED, &bmp581_dev);
+    bmp5_error_codes_print_result("bmp_read_once set_power_mode", rslt);
+
+    if (k_sem_take(&bmp_drdy_sem, K_MSEC(50)) != 0) {
+        printk("bmp: datalog read timed out waiting for DRDY\r\n");
+    }
+    bmp_datalog_read_pending = false;
+
+    uint8_t result = get_sensor_data(&osr_odr_press_cfg, &bmp581_dev);
+    bmp5_error_codes_print_result("bmp_read_once get_sensor_data", result);
+    bmp5_set_power_mode(BMP5_POWERMODE_DEEP_STANDBY, &bmp581_dev);
+
+    printk("bmp: datalog read pressure=%f hPa temperature=%f C\r\n",
+           bmp_data.pressure, bmp_data.temperature);
+    if(pressure){
+        *pressure = bmp_data.pressure;
+    }
+    if(temperature){
+        *temperature = bmp_data.temperature;
+    }
 }
 
-extern void send_data_bmp(void){
+extern void send_data_bmp(struct k_work *work){
+    /* Take the edge time BEFORE the I2C read. At ~500 Hz a read on the
+     * 100 kHz bus takes about half a sample period, so the next DRDY edge
+     * regularly lands in the middle of it. Reading bmp_data.timestmap
+     * afterwards would stamp this sample with that newer edge - and the
+     * extra work run which that edge queued then writes the very same
+     * value again. Measured on a phyphox:mini: 0.33 % of all samples
+     * carried a duplicate timestamp this way, always inside one packet.
+     * irq_lock() also keeps the 64 bit value from being read half old and
+     * half new on this 32 bit core. */
+    unsigned int key = irq_lock();
+    int64_t sample_ticks = bmp_data.timestmap;
+    irq_unlock(key);
+
     uint8_t result = get_sensor_data(&osr_odr_press_cfg, &bmp581_dev);
     bmp5_error_codes_print_result("get_sensor_data", result);
+    /* Hot path: runs ~500 times per second on the system workqueue stack,
+     * and formatting two %f with newlib costs both CPU time and a lot of
+     * stack. CONFIG_PRINTK ends up enabled even in the release build -
+     * NCS_BOOT_BANNER selects it - so without a guard the formatting is
+     * done and the result then dropped for lack of a console backend. */
+    if(DEBUG){
+        printk("bmp: new reading pressure=%f hPa temperature=%f C\r\n",
+               bmp_data.pressure, bmp_data.temperature);
+    }
 
     if(bmp_data.logging){
-        float currentime = bmp_data.timestmap/32768.0;
+        float currentime = sample_ticks/32768.0;
         printk("currently in logging mode, store data! seconds: %f\r\n",currentime);
         
         //skip if we are under x seconds since last save
@@ -225,7 +282,7 @@ extern void send_data_bmp(void){
 
         bmp_data.array[0+bmp_data.current_event*3]=bmp_data.pressure;
         bmp_data.array[1+bmp_data.current_event*3]=bmp_data.temperature;
-        bmp_data.array[2+bmp_data.current_event*3]=(bmp_data.timestmap/32768.0)-global_timestamp;
+        bmp_data.array[2+bmp_data.current_event*3]=(sample_ticks/32768.0)-global_timestamp;
 
         bmp_data.current_event++;
         if(bmp_data.current_event == bmp_data.max_events){
@@ -245,6 +302,19 @@ extern int8_t init_bmp(){
     bmp_data.max_events=1;
     bmp_data.logging = false;
     bmp_data.live = false;
+
+    k_sem_init(&bmp_drdy_sem, 0, 1);
+
+    /* Point config fields at sane defaults before the first set_config()
+     * call below, which dereferences them; otherwise (until the BLE config
+     * characteristic is written at least once via submit_config_bmp()) they
+     * are NULL. */
+    bmp_data.enable = &bmp_data.config[0];
+    bmp_data.oversampling_p = &bmp_data.config[1];
+    bmp_data.iir = &bmp_data.config[2];
+    bmp_data.config[0] = 1;
+    bmp_data.config[1] = BMP5_OVERSAMPLING_1X;
+    bmp_data.config[2] = BMP5_IIR_FILTER_COEFF_1;
 
     dev_addr = BMP5_I2C_ADDR_PRIM;
     bmp581_dev.read = bmp5_i2c_read;
@@ -296,25 +366,28 @@ extern int8_t init_bmp(){
 }
 
 extern uint8_t sleep_bmp(bool SLEEP){
+    uint8_t rslt;
     if(SLEEP){
-            uint8_t rslt = bmp5_set_power_mode(BMP5_POWERMODE_DEEP_STANDBY, &bmp581_dev);
+        rslt = bmp5_set_power_mode(BMP5_POWERMODE_DEEP_STANDBY, &bmp581_dev);
     }else{
         if(bmp_data.logging == true && bmp_data.live == false){
-            bmp5_set_power_mode(BMP5_POWERMODE_NORMAL, &bmp581_dev);
+            rslt = bmp5_set_power_mode(BMP5_POWERMODE_NORMAL, &bmp581_dev);
         }else{
-            bmp5_set_power_mode(BMP5_POWERMODE_CONTINOUS, &bmp581_dev);
+            rslt = bmp5_set_power_mode(BMP5_POWERMODE_CONTINOUS, &bmp581_dev);
         }
-    }    
+    }
+    return rslt;
 }
 
 extern uint8_t bmp_loggingmode(){
     //TODO
     uint8_t rslt = bmp5_set_power_mode(BMP5_POWERMODE_DEEP_STANDBY, &bmp581_dev);
-    bmp_data.oversampling_p = 0x04;
+    *bmp_data.oversampling_p = 0x04;
     *bmp_data.iir = 0x01;
-    osr_odr_press_cfg.osr_p=*bmp_data.oversampling_p;   
+    osr_odr_press_cfg.osr_p=*bmp_data.oversampling_p;
     set_config(&osr_odr_press_cfg, &bmp581_dev);
     sleep_bmp(false);
+    return rslt;
 }
 
 void submit_config_bmp(){
@@ -391,7 +464,7 @@ void submit_config_bmp(){
     bmp_data.enable = &bmp_data.config[0];
     bmp_data.oversampling_p = &bmp_data.config[1];
     bmp_data.iir = &bmp_data.config[2];
-    osr_odr_press_cfg.osr_p= &bmp_data.oversampling_p;
+    osr_odr_press_cfg.osr_p= *bmp_data.oversampling_p;
     
     bmp_data.current_event=0;
     

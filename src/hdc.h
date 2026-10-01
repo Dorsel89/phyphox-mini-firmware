@@ -26,9 +26,9 @@ extern bool init_hdc();
 extern void sleep_hdc(bool sleep);
 extern void submit_config_hdc();
 
-void send_data_hdc();
+void send_data_hdc(struct k_work *work);
 void hdc_data_ready();
-void set_config_hdc();
+void set_config_hdc(struct k_work *work);
 
-extern void hdc_logging(bool l);
+extern void hdc_read_once(float *temperature, float *humidity);
 #endif

@@ -22,10 +22,10 @@ extern int8_t init_stcc4();
 extern void submit_config_stcc4();
 extern uint8_t sleep_stcc4(bool SLEEP);
 
-void send_data_stcc4();
+void send_data_stcc4(struct k_work *work);
 void stcc4_data_ready();
-void set_config_stcc4();
+void set_config_stcc4(struct k_work *work);
 
 extern uint8_t stcc4_compensate(float t, float rh);
-extern void stcc4_logging(bool l);
+extern void stcc4_read_once(float *co2);
 #endif

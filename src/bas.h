@@ -28,7 +28,7 @@ extern void init_BAS();
 static struct k_timer timer_bas;
 static struct k_work work_bas;
 
-void update_coincell_level();
+void update_coincell_level(struct k_work *work);
 float getVoltage();
 
 uint8_t battery_level(float);

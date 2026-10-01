@@ -143,7 +143,7 @@ flash_spi_master: &spi2 {
         label = "AT25FF161A";
 		/*[c2 28 15] [1f 46 08] (mx25)(at25)*/
         jedec-id = [c2 28 15];
-        size = <0x200000>;/* 2 MByte */	
+        size = <0x1000000>;/* 2 MByte = 16 Mbit (DT "size" is in bits, not bytes) */
 		has-dpd;
 		t-enter-dpd = <3000>;
 		t-exit-dpd = <160000>;

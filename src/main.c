@@ -10,6 +10,7 @@
 #include "hdc.h"
 #include "lsm6dsr.h"
 #include "stcc4Zephyr.h"
+#include "datalog.h"
 
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
@@ -20,66 +21,27 @@
 
 #define sensirion_hal_sleep_us sensirion_i2c_hal_sleep_usec
 
-#include <zephyr/drivers/spi.h>
-#define FLASH_LABEL "MX25R6435F"
-
-#define FIRMWARE_VERSION_STR "1.0.1"
-
-struct spi_cs_control spi_flash_cs = {
-	.gpio = SPI_CS_GPIOS_DT_SPEC_GET(DT_NODELABEL(flash_spi_master)),
-	.delay = 0,
-};
-
-static const struct spi_config spi_cfg = {
-    .frequency = 8000000,
-    .operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_TRANSFER_MSB,
-    .slave = 0,
-    .cs = &spi_flash_cs,
-};
-
 int main(void)
 {
         printk("HELLOWORLD\r\n");
-        
+
         //init logging
         logging.enable = true;
-        logging.interval_s = 60;
-        
+
         init_ble();
         init_hdc();
         init_bmp();
         init_lsm();
         init_stcc4();
+        //restores the settings stored in flash; only fall back to the
+        //default when this fob has never been configured (or was erased)
+        if (!init_datalog()) {
+                //default: log CO2, temperature, humidity and pressure every 300s
+                datalog_configure(DATALOG_CMD_START,
+                                  DATALOG_SENSOR_CO2 | DATALOG_SENSOR_TEMP | DATALOG_SENSOR_HUMIDITY | DATALOG_SENSOR_PRESSURE,
+                                  300);
+        }
         //init_BAS();
-       
-        
-        const struct device *flash_dev = DEVICE_DT_GET(DT_NODELABEL(at25ff161a));
-       
-        if (!device_is_ready(flash_dev)) {
-                printk("SPI NOR Device nicht bereit\n");
-        }
 
-        /*
-        0xB9 for mx25r6435f
-        0x79 for AT25FF161A
-        */
-       
-        uint8_t dpd_cmd = 0xB9;
-        int ret = spi_write(flash_dev, &spi_cfg, &(struct spi_buf_set){
-                .buffers = &(struct spi_buf){
-                .buf = &dpd_cmd,
-                .len = 1,
-                },
-                .count = 1,
-        });
-        if (ret) {
-                printk("Deep Power Down Kommando fehlgeschlagen: %d\n", ret);
-        } else {
-                printk("Flash-Speicher in DeepSleep versetzt.\n");
-        }
-        
-        
-        pm_device_action_run(flash_dev,PM_DEVICE_ACTION_SUSPEND);
-        
         return 0;
 }

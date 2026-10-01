@@ -84,7 +84,7 @@ float getVoltage(){
 
 
 
-void update_coincell_level(){
+void update_coincell_level(struct k_work *work){
 	set_coincell_level(battery_level(getVoltage()));
 };
 
@@ -94,7 +94,7 @@ void time_to_update_battery_service(){
 }
 
 uint8_t battery_level(float adc_voltage){
-	int bat =(uint8_t)adc_voltage*100/3.1;
+	int bat = (uint8_t)(adc_voltage*100/3.1);
 	printf("adc: %f bat: %i\n",adc_voltage, bat);
 	return bat;
 };

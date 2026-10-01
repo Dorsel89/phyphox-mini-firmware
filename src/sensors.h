@@ -5,7 +5,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/sensor.h>
 
-#define DEBUG				true
+#define DEBUG				false
 #define PRINT_SENSOR_DATA 	true
 
 #define SENSOR_BMP581_ID		1
@@ -13,6 +13,7 @@
 #define SENSOR_LSM6DSR_GYR_ID	3
 #define SENSOR_HDC_ID			4
 #define SENSOR_STCC4_ID			5
+#define SENSOR_DATALOG_ID		6
 
 #define LOG_MULTIPLIER 70
 
@@ -29,12 +30,6 @@ static inline float sensor_value_to_float(const struct sensor_value *val)
 	return (float)val->val1 + (float)val->val2 / 1000000;
 }
 */
-
-extern uint8_t OPERATING_MODE;
-#define MODE_SLEEPING	0
-#define MODE_PHYPHOX	1
-#define MODE_BTHOME		2
-
 
 typedef struct {
 	int max_events;
@@ -75,12 +70,16 @@ typedef struct {
 
 typedef struct {
 	bool enable;
-	uint16_t interval_s;
 }LOGGING;
 
 typedef struct {
 	uint8_t config[20];
 }PHYFOB;
+
+typedef struct {
+	uint8_t config[20];
+	float array[1];
+}DATALOG_CONFIG;
 
 typedef struct {
 	uint8_t config[20];
@@ -122,5 +121,6 @@ typedef struct {
 
 extern DATALOGGING LOG;
 extern PHYFOB phyfob_config;
+extern DATALOG_CONFIG datalog_config;
 
 #endif // SENSORS_H

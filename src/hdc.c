@@ -1,23 +1,28 @@
 #include "hdc.h"
 //HDC hdc_data;
 
-void bthome_mode(){
-    hdc_data.timer_interval = logging.interval_s*1000;
-    k_timer_start(&timer_hdc, K_MSEC(hdc_data.timer_interval), K_MSEC(hdc_data.timer_interval));
-}
-extern bool init_hdc() 
-{   
+extern bool init_hdc()
+{
+    /* Register the work items and the timer before anything can fail.
+     * They only store function pointers, no hardware is touched. If the
+     * sensor does not answer we still leave this function early, but a
+     * later configuration write then finds an initialised work item
+     * instead of queueing a NULL handler and faulting the whole fob. */
+    k_work_init(&work_hdc, send_data_hdc);
+	k_work_init(&config_work_hdc, set_config_hdc);
+    k_timer_init(&timer_hdc, hdc_data_ready, NULL);
+
     if(!device_is_ready(hdc_dev)){
         printk("Device not ready or not found");
         return false;
     }
-    hdc_data.timer_interval = logging.interval_s*1000;
-    k_work_init(&work_hdc, send_data_hdc);
-	k_work_init(&config_work_hdc, set_config_hdc);
-    k_timer_init(&timer_hdc, hdc_data_ready, NULL);
-    //OPERATING_MODE = MODE_BTHOME;
-    //bthome_mode();
-    sleep_hdc(!logging.enable);
+    /* The datalog module now triggers every sensor's measurement directly
+     * (see datalog_tick()) at its own configured interval, so this legacy
+     * independently-timed background timer must stay stopped - starting it
+     * here (as sleep_hdc(!logging.enable) used to, since logging.enable is
+     * true at boot) caused a redundant real sensor read every 60s on top of
+     * the datalog interval. */
+    sleep_hdc(true);
 
     return true;
 }
@@ -32,11 +37,26 @@ extern void sleep_hdc(bool sleep)
     }
 }
 
-extern void hdc_logging(bool l){
-    if(l){
-        k_timer_start(&timer_hdc, K_MSEC(logging.interval_s*1000), K_MSEC(logging.interval_s*1000));
-    }else{
-        k_timer_stop(&timer_hdc);
+/* Synchronous single-shot read for the datalog module: sensor_sample_fetch()
+ * already blocks until the measurement is ready, so this is called directly
+ * at datalog-tick time instead of relying on hdc's own independently-timed
+ * background sample, which could be up to a full interval stale. */
+void hdc_read_once(float *temperature, float *humidity)
+{
+    sensor_sample_fetch(hdc_dev);
+    sensor_channel_get(hdc_dev, SENSOR_CHAN_AMBIENT_TEMP, &hdc_temp);
+    sensor_channel_get(hdc_dev, SENSOR_CHAN_HUMIDITY, &hdc_humid);
+
+    hdc_data.temperature = sensor_value_to_float(&hdc_temp);
+    hdc_data.humidity = sensor_value_to_float(&hdc_humid);
+
+    printk("hdc: datalog read temperature=%f C humidity=%f %%\r\n",
+           hdc_data.temperature, hdc_data.humidity);
+    if(temperature){
+        *temperature = hdc_data.temperature;
+    }
+    if(humidity){
+        *humidity = hdc_data.humidity;
     }
 }
 
@@ -46,7 +66,7 @@ void hdc_data_ready()
 	k_work_submit(&work_hdc);
 }
 
-void send_data_hdc()
+void send_data_hdc(struct k_work *work)
 {
     sensor_sample_fetch(hdc_dev);
     sensor_channel_get(hdc_dev, SENSOR_CHAN_AMBIENT_TEMP, &hdc_temp);
@@ -54,18 +74,10 @@ void send_data_hdc()
     
     hdc_data.temperature = sensor_value_to_float(&hdc_temp);
     hdc_data.humidity = sensor_value_to_float(&hdc_humid);
-    if(OPERATING_MODE == MODE_BTHOME){
-        int16_t temp = (int16_t)hdc_data.temperature*100;
-        uint16_t hum = (int16_t)hdc_data.humidity*100;
-        printk("new data hdc t: %i h: %i \r\n",temp,hum);
-        uint8_t dat[4];
-        memcpy(&dat[0],&temp,2);
-        memcpy(&dat[0+2],&hum,2);
-        update_advertising(dat[0],dat[1],dat[2],dat[3]);
-        return;
-    }
 
     if(logging.enable){
+        printk("hdc: new reading temperature=%f C humidity=%f %%\r\n",
+               hdc_data.temperature, hdc_data.humidity);
         stcc4_compensate(hdc_data.temperature,hdc_data.humidity);
         return;
     }
@@ -78,7 +90,7 @@ void send_data_hdc()
     send_data(SENSOR_HDC_ID, &hdc_data.array, 4*3);
 }
 
-void set_config_hdc() 
+void set_config_hdc(struct k_work *work)
 {
     sleep_hdc(true);
     hdc_data.timer_interval = hdc_data.config[1]*100;
