@@ -52,6 +52,8 @@ async def run(dev, rep, args):
                   not bad, f"Laengen {dict(cap.lengths)}")
 
         co2 = [f["co2"] for f in frames]
+        rep.raw("stcc4.basic", {"CO2": (co2, "ppm")}, t=[f["t"] for f in frames],
+                label="CO2-Messwerte im Grundtest")
         zeros = sum(1 for c in co2 if c == 0.0)
         rep.metric("stcc4.zeros_fraction", zeros / len(co2),
                    label="Anteil Nullwerte")

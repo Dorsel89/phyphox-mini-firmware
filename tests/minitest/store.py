@@ -51,6 +51,8 @@ def make_record(report, *, run_id, board_id, board_name=None, firmware=None,
         # every single verdict with its detail text, so the HTML report can
         # show which check failed and why
         "checks": report.entries,
+        # measured series behind some of the checks, to judge them by eye
+        "raw": report.raw_series,
         **(extra or {}),
     }
 

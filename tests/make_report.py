@@ -20,8 +20,10 @@ The page has two kinds of views:
 import argparse
 import datetime
 import html
+import math
 import os
 import re
+import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +79,17 @@ def metric_value(m):
     return m.get("value") if isinstance(m, dict) else m
 
 
+# Acceleration is stored the way the tests measure it (g, mg) but shown in
+# SI units. 9.81 like the firmware and the tests, not 9.80665.
+G = 9.81
+SI_UNITS = {"g": (G, "m/s²"), "mg": (G / 1000.0, "m/s²")}
+
+
+def to_si(value, unit):
+    factor, si_unit = SI_UNITS.get(unit, (1.0, unit))
+    return value * factor, si_unit
+
+
 def build_index(records):
     """Collect everything the page needs.
 
@@ -109,10 +122,12 @@ def build_index(records):
             value = metric_value(m)
             if value is None:
                 continue
-            history.setdefault(key, {}).setdefault(bid, []).append((when, float(value)))
+            raw_unit = (m.get("unit") or "") if isinstance(m, dict) else ""
+            value, unit = to_si(float(value), raw_unit)
+            history.setdefault(key, {}).setdefault(bid, []).append((when, value))
             if isinstance(m, dict):
                 labels.setdefault(key, m.get("label") or key)
-                units.setdefault(key, m.get("unit") or "")
+                units.setdefault(key, unit)
     for per_board in history.values():
         for points in per_board.values():
             points.sort(key=lambda p: p[0])
@@ -123,7 +138,8 @@ def build_index(records):
         for rec in b["latest"].values():
             for key, m in (rec.get("metrics") or {}).items():
                 if metric_value(m) is not None:
-                    b["current"][key] = float(metric_value(m))
+                    raw_unit = (m.get("unit") or "") if isinstance(m, dict) else ""
+                    b["current"][key] = to_si(float(metric_value(m)), raw_unit)[0]
     return boards, history, labels, units
 
 
@@ -144,39 +160,94 @@ def esc(text):
     return html.escape(str(text if text is not None else ""))
 
 
-def svg_bars(pairs, unit, width=520, height=190):
-    """pairs: [(label, value, colour)] - the latest value per board."""
-    if not pairs:
-        return "<p class='none'>keine Daten</p>"
-    pad_l, pad_b, pad_t = 62, 34, 12
-    plot_w, plot_h = width - pad_l - 14, height - pad_b - pad_t
-    values = [v for _, v, _ in pairs]
-    lo, hi = min(values + [0.0]), max(values + [0.0])
+def hist_bins(values):
+    """Equal-width bins over the data range, Sturges' rule clamped to 5..15.
+    Returns the bin edges."""
+    lo, hi = min(values), max(values)
     if hi == lo:
-        hi = lo + 1.0
-    span = hi - lo
-    zero_y = pad_t + plot_h * (hi - 0) / span
-    slot = plot_w / len(pairs)
-    bar_w = min(58.0, slot * 0.62)
+        pad = abs(lo) * 0.01 or 0.5
+        return [lo - pad, lo + pad]
+    k = max(5, min(15, math.ceil(math.log2(len(values)) + 1)))
+    step = (hi - lo) / k
+    return [lo + i * step for i in range(k + 1)]
+
+
+def stats_line(values, unit):
+    n = len(values)
+    mean = statistics.fmean(values)
+    sd = statistics.stdev(values) if n > 1 else 0.0
+    # a relative spread only means something away from zero (not for a gyro bias)
+    rel = f" ({sd / abs(mean) * 100:.1f} %)" if n > 1 and abs(mean) > 3 * sd else ""
+    return (f"n = {n} · Mittelwert {fmt(mean)} · σ {fmt(sd)}{rel} · "
+            f"Spanne {fmt(min(values))} … {fmt(max(values))} {esc(unit)}")
+
+
+def svg_hist(named_values, unit, width=380, height=180):
+    """Distribution of one metric across boards (one value per board, its
+    latest run). Bars count boards per bin; the band marks mean ± 1 σ."""
+    if not named_values:
+        return "<p class='none'>keine Daten</p>"
+    values = [v for _, v in named_values]
+    edges = hist_bins(values)
+    nb = len(edges) - 1
+    bins = [[] for _ in range(nb)]
+    for name, v in named_values:
+        i = min(nb - 1, int((v - edges[0]) / (edges[-1] - edges[0]) * nb))
+        bins[max(0, i)].append(name)
+    top = max(len(b) for b in bins)
+
+    pad_l, pad_r, pad_t, pad_b = 34, 14, 14, 40
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+    base = pad_t + plot_h
+
+    def x(v):
+        return pad_l + plot_w * (v - edges[0]) / (edges[-1] - edges[0])
+
+    def y(count):
+        return base - plot_h * count / top
+
     out = [f"<svg viewBox='0 0 {width} {height}' class='chart' role='img'>"]
-    for frac in (0.0, 0.5, 1.0):
-        v = hi - span * frac
-        y = pad_t + plot_h * frac
-        out.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{width - 14}' y2='{y:.1f}' "
-                   f"class='grid'/>")
-        out.append(f"<text x='{pad_l - 6}' y='{y + 4:.1f}' class='tick end'>"
+    # mean ± 1 sigma band behind the bars
+    if len(values) > 1:
+        mean, sd = statistics.fmean(values), statistics.stdev(values)
+        x0, x1 = max(pad_l, x(mean - sd)), min(pad_l + plot_w, x(mean + sd))
+        if x1 > x0:
+            out.append(f"<rect x='{x0:.1f}' y='{pad_t}' width='{x1 - x0:.1f}' "
+                       f"height='{plot_h}' class='sigma'/>")
+    # integer count gridlines
+    step = max(1, math.ceil(top / 4))
+    for c in range(0, top + 1, step):
+        out.append(f"<line x1='{pad_l}' y1='{y(c):.1f}' x2='{pad_l + plot_w}' "
+                   f"y2='{y(c):.1f}' class='grid'/>")
+        out.append(f"<text x='{pad_l - 6}' y='{y(c) + 3.5:.1f}' class='tick end'>{c}</text>")
+    # bars: 2px gap, rounded top, square foot on the baseline
+    slot = plot_w / nb
+    r = 4.0
+    for i, names in enumerate(bins):
+        bx, bw = pad_l + slot * i + 1, max(1.0, slot - 2)
+        tip = (f"{fmt(edges[i])} … {fmt(edges[i + 1])} {unit}: {len(names)} "
+               f"{'Board' if len(names) == 1 else 'Boards'}"
+               + (f" – {', '.join(sorted(names))}" if names else ""))
+        if names:
+            by = y(len(names))
+            rr = min(r, bw / 2, base - by)
+            out.append(
+                f"<path class='bar' d='M{bx:.1f},{base:.1f} V{by + rr:.1f} "
+                f"Q{bx:.1f},{by:.1f} {bx + rr:.1f},{by:.1f} H{bx + bw - rr:.1f} "
+                f"Q{bx + bw:.1f},{by:.1f} {bx + bw:.1f},{by + rr:.1f} V{base:.1f} Z'/>")
+        # hit target covers the whole column, larger than the bar
+        out.append(f"<rect x='{pad_l + slot * i:.1f}' y='{pad_t}' width='{slot:.1f}' "
+                   f"height='{plot_h}' class='hit'><title>{esc(tip)}</title></rect>")
+    if len(values) > 1:
+        mx = x(statistics.fmean(values))
+        out.append(f"<line x1='{mx:.1f}' y1='{pad_t}' x2='{mx:.1f}' y2='{base}' class='mean'/>")
+    out.append(f"<line x1='{pad_l}' y1='{base}' x2='{pad_l + plot_w}' y2='{base}' class='axisline'/>")
+    for v, anchor in ((edges[0], "start"), ((edges[0] + edges[-1]) / 2, "mid"),
+                      (edges[-1], "end")):
+        out.append(f"<text x='{x(v):.1f}' y='{base + 14}' class='tick {anchor}'>"
                    f"{esc(fmt(v))}</text>")
-    for i, (label, value, colour) in enumerate(pairs):
-        cx = pad_l + slot * (i + 0.5)
-        y = pad_t + plot_h * (hi - value) / span
-        top, bottom = min(y, zero_y), max(y, zero_y)
-        out.append(f"<rect x='{cx - bar_w / 2:.1f}' y='{top:.1f}' width='{bar_w:.1f}' "
-                   f"height='{max(1.0, bottom - top):.1f}' fill='{colour}' rx='2'/>")
-        out.append(f"<text x='{cx:.1f}' y='{height - 20}' class='tick mid'>"
-                   f"{esc(label)}</text>")
-        out.append(f"<text x='{cx:.1f}' y='{top - 4:.1f}' class='tick mid val'>"
-                   f"{esc(fmt(value))}</text>")
-    out.append(f"<text x='{pad_l}' y='{height - 5}' class='axis'>{esc(unit)}</text>")
+    out.append(f"<text x='{pad_l + plot_w / 2:.1f}' y='{height - 6}' class='axis mid'>"
+               f"{esc(unit)}</text>")
     out.append("</svg>")
     return "".join(out)
 
@@ -295,7 +366,9 @@ def overview(order, boards, labels, units, colours, tests):
         parts.append("</section>")
         return "\n".join(parts)
 
-    parts.append("<h2>Messwerte im Vergleich</h2><div class='scroll'><table><thead><tr>"
+    parts.append("<details class='fold'><summary><h2>Messwerte im Vergleich</h2>"
+                 "<span class='mut'>Tabelle aller Boards, zum Aufklappen</span></summary>"
+                 "<div class='scroll'><table><thead><tr>"
                  "<th>Messgroesse</th>"
                  + "".join(f"<th class='num'>{esc(name(b))}</th>" for b in order)
                  + "</tr></thead><tbody>")
@@ -304,22 +377,115 @@ def overview(order, boards, labels, units, colours, tests):
                         for b in order)
         parts.append(f"<tr><td>{metric_title(key, labels, units)}"
                      f"<br><code class='key'>{esc(key)}</code></td>{cells}</tr>")
-    parts.append("</tbody></table></div>")
+    parts.append("</tbody></table></div></details>")
 
+    parts.append("<p class='note'>Die Histogramme zeigen, wie die Messwerte ueber alle "
+                 "Boards streuen (je Board der letzte Lauf). Das helle Band markiert "
+                 "Mittelwert ± 1 σ, die Linie den Mittelwert; senkrecht steht die Anzahl der Boards je Wertebereich. Beschleunigungen sind in "
+                 "m/s² umgerechnet (1 g = 9,81 m/s²).</p>")
     groups = {}
     for key in keys:
         groups.setdefault(group_of(key), []).append(key)
     for group in sorted(groups, key=group_sort):
         parts.append(f"<h2>{esc(GROUP_TITLES.get(group, group))}</h2><div class='grid2'>")
         for key in groups[group]:
-            bars = [(name(b), b["current"][key], colours[b["id"]])
-                    for b in order if key in b["current"]]
+            vals = [(name(b), b["current"][key]) for b in order if key in b["current"]]
+            unit = units.get(key, "")
             parts.append(f"<section class='metric'><h3>{metric_title(key, labels, units)}"
                          f"</h3><code class='key'>{esc(key)}</code>"
-                         f"{svg_bars(bars, units.get(key, ''))}</section>")
+                         f"<p class='stats'>{stats_line([v for _, v in vals], unit)}</p>"
+                         f"{svg_hist(vals, unit)}</section>")
         parts.append("</div>")
     parts.append("</section>")
     return "\n".join(parts)
+
+
+# -- raw series -------------------------------------------------------------
+def svg_series(xs, values, unit, x_label, width=380, height=170):
+    """One measured series over time (or over the sample index)."""
+    pad_l, pad_r, pad_t, pad_b = 54, 12, 10, 34
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+    x0, x1 = xs[0], xs[-1]
+    if x1 == x0:
+        x1 = x0 + 1
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        pad = abs(hi) * 0.01 or 0.5
+        lo, hi = lo - pad, hi + pad
+
+    def x(v):
+        return pad_l + plot_w * (v - x0) / (x1 - x0)
+
+    def y(v):
+        return pad_t + plot_h * (hi - v) / (hi - lo)
+
+    out = [f"<svg viewBox='0 0 {width} {height}' class='chart' role='img'>"]
+    for frac in (0.0, 0.5, 1.0):
+        yy = pad_t + plot_h * frac
+        out.append(f"<line x1='{pad_l}' y1='{yy:.1f}' x2='{pad_l + plot_w}' y2='{yy:.1f}' "
+                   f"class='grid'/>")
+        out.append(f"<text x='{pad_l - 6}' y='{yy + 3.5:.1f}' class='tick end'>"
+                   f"{esc(fmt(hi - (hi - lo) * frac))}</text>")
+    d = " ".join(f"{'M' if i == 0 else 'L'}{x(a):.1f},{y(v):.1f}"
+                 for i, (a, v) in enumerate(zip(xs, values)))
+    out.append(f"<path d='{d}' class='rawline'/>")
+    if len(values) <= 150:
+        # few points: show each one, with its value on hover
+        for a, v in zip(xs, values):
+            out.append(f"<circle cx='{x(a):.1f}' cy='{y(v):.1f}' r='4' class='rawdot'>"
+                       f"<title>{esc(fmt(a))} {esc(x_label)}: {esc(fmt(v))} {esc(unit)}"
+                       f"</title></circle>")
+    for v, anchor in ((xs[0], "start"), (xs[-1], "end")):
+        out.append(f"<text x='{x(v):.1f}' y='{pad_t + plot_h + 14}' class='tick {anchor}'>"
+                   f"{esc(fmt(v))}</text>")
+    out.append(f"<text x='{pad_l + plot_w / 2:.1f}' y='{height - 6}' class='axis mid'>"
+               f"{esc(x_label)}</text>")
+    out.append("</svg>")
+    return "".join(out)
+
+
+def raw_block(raw):
+    """Collapsed charts and value table for one stored raw entry."""
+    t = raw.get("t")
+    series = raw.get("series") or {}
+    if not series:
+        return ""
+    n_shown = max(len(s["values"]) for s in series.values())
+    if t and len(t) == n_shown:
+        xs, x_label = [v - t[0] for v in t], "s"
+    else:
+        step = raw.get("step", 1)
+        xs, x_label = [i * step for i in range(n_shown)], "Messwert-Nr."
+    note = (f"{raw.get('n', n_shown)} Werte" if raw.get("step", 1) == 1 else
+            f"{raw.get('n')} Werte, gezeigt jeder {raw.get('step')}. ({n_shown})")
+
+    charts, columns = [], []
+    for name, sv in series.items():
+        values, unit = sv["values"], sv.get("unit", "")
+        values, unit = [to_si(v, unit)[0] for v in values], to_si(0.0, unit)[1]
+        columns.append((name, unit, values))
+        distinct = len(set(values))
+        charts.append(
+            f"<figure class='rawfig'><figcaption><b>{esc(name)}</b> "
+            f"<span class='unit'>{esc(unit)}</span></figcaption>"
+            f"<p class='stats'>{stats_line(values, unit)} · {distinct} verschiedene "
+            f"{'Wert' if distinct == 1 else 'Werte'}</p>"
+            f"{svg_series(xs, values, unit, x_label)}</figure>")
+
+    head = f"<th class='num'>{esc(x_label)}</th>" + "".join(
+        f"<th class='num'>{esc(name)} <span class='unit'>{esc(unit)}</span></th>"
+        for name, unit, _ in columns)
+    body = "".join(
+        "<tr><td class='num'>" + esc(fmt(xs[i])) + "</td>"
+        + "".join(f"<td class='num'>{esc(fmt(vals[i])) if i < len(vals) else ''}</td>"
+                  for _, _, vals in columns) + "</tr>"
+        for i in range(n_shown))
+    return (f"<details class='raw'><summary>Rohdaten: {esc(raw.get('label'))} "
+            f"<span class='mut'>({note})</span></summary>"
+            f"<div class='grid2'>{''.join(charts)}</div>"
+            f"<details class='rawtable'><summary>Werte als Tabelle</summary>"
+            f"<div class='tablebox'><table><thead><tr>{head}</tr></thead>"
+            f"<tbody>{body}</tbody></table></div></details></details>")
 
 
 # -- one board --------------------------------------------------------------
@@ -354,9 +520,18 @@ def board_view(b, history, labels, units, colour, tests):
         if checks is None:
             body = "<p class='none'>Einzelpruefungen wurden in diesem Lauf nicht gespeichert.</p>"
         else:
+            raws = {}
+            for raw in (rec.get("raw") or {}).values():
+                raws.setdefault(raw.get("section"), []).append(raw)
+
+            def flush(sec):
+                for raw in raws.pop(sec, []):
+                    rows.append(f"<tr class='rawrow'><td colspan='3'>{raw_block(raw)}</td></tr>")
+
             rows, section = [], object()
             for e in checks:
                 if e.get("section") != section:
+                    flush(section)
                     section = e.get("section")
                     if section:
                         rows.append(f"<tr class='sec'><td colspan='3'>{esc(section)}</td></tr>")
@@ -365,6 +540,9 @@ def board_view(b, history, labels, units, colour, tests):
                             f"{VERDICT_TEXT.get(v, v)}</span></td>"
                             f"<td>{esc(e.get('title'))}</td>"
                             f"<td class='detail'>{esc(e.get('detail'))}</td></tr>")
+            flush(section)
+            for sec in list(raws):          # sections without checks, just in case
+                flush(sec)
             body = ("<table class='checks'><tbody>" + "".join(rows) + "</tbody></table>")
         open_attr = " open" if st == "FAIL" else ""
         parts.append(f"<details class='test'{open_attr}><summary class='tsum'>{summary}"
@@ -505,6 +683,24 @@ TEMPLATE = """<!doctype html>
  .tick.start{text-anchor:start} .tick.val{fill:var(--fg);font-weight:600}
  .axis{font-size:10px;fill:var(--mut)}
  .none{color:var(--mut);font-size:12px;padding:0 12px}
+ .fold{margin:30px 0 0} .fold>summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:12px;padding-bottom:5px;border-bottom:1px solid var(--line)}
+ .fold>summary::-webkit-details-marker{display:none}
+ .fold>summary h2{margin:0;padding:0;border:0;display:inline}
+ .fold>summary::before{content:'▸';color:var(--mut)} .fold[open]>summary::before{content:'▾'}
+ .fold>summary .mut{font-size:12px}
+ .stats{margin:4px 0 0;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
+ .bar{fill:var(--accent)} .hit{fill:transparent} .hit:hover{fill:var(--line);fill-opacity:.35}
+ .sigma{fill:var(--accent);fill-opacity:.10} .mean{stroke:var(--fg);stroke-width:1.5;stroke-dasharray:4 3;opacity:.7}
+ .axisline{stroke:var(--mut);stroke-width:1} .axis.mid{text-anchor:middle}
+ .rawrow>td{padding:2px 10px 8px}
+ details.raw>summary,details.rawtable>summary{cursor:pointer;color:var(--accent);font-size:13px;padding:4px 0}
+ details.raw{border-left:3px solid var(--line);padding-left:10px;margin:2px 0}
+ .rawfig{margin:6px 0} .rawfig figcaption{font-size:13px}
+ .rawline{fill:none;stroke:var(--accent);stroke-width:2}
+ .rawdot{fill:var(--accent);stroke:var(--bg);stroke-width:1.5}
+ .rawdot:hover{r:6}
+ .tablebox{max-height:320px;overflow:auto;border:1px solid var(--line);border-radius:6px}
+ .tablebox th{position:sticky;top:0;background:var(--bg)}
 </style>
 <noscript><style>.view{display:block} nav{display:none}</style></noscript>
 </head><body>

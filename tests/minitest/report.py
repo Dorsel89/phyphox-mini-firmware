@@ -8,10 +8,15 @@ Two kinds of output:
   compared, for instance to see whether a sensor has aged.
 """
 import json
+import math
 import sys
 import time
 
 PASS, FAIL, WARN, SKIP, INFO = "PASS", "FAIL", "WARN", "SKIP", "INFO"
+# raw series longer than this are thinned to every k-th value before storing,
+# so a single run stays a few hundred kB at most
+MAX_RAW_POINTS = 2000
+
 _MARK = {PASS: "[ ok ]", FAIL: "[FAIL]", WARN: "[warn]", SKIP: "[skip]", INFO: "      "}
 
 
@@ -21,6 +26,7 @@ class Report:
         self.quiet = quiet
         self.entries = []
         self.metrics = {}
+        self.raw_series = {}
         self.started = time.time()
         self._section = None
 
@@ -87,6 +93,28 @@ class Report:
         self._add(INFO, shown, detail)
         return value
 
+    def raw(self, key, series, t=None, label=None):
+        """Keep a measured series so the report can show it next to the
+        checks of the current section - to judge a verdict yourself.
+
+        series: {name: (values, unit)}, all the same length
+        t:      timestamps in seconds, or None to plot against the index
+        """
+        n = max((len(v) for v, _ in series.values()), default=0)
+        if not n:
+            return
+        step = max(1, math.ceil(n / MAX_RAW_POINTS))
+
+        def thin(seq):
+            return [float(f"{x:.6g}") for x in seq[::step]]
+
+        self.raw_series[key] = {
+            "label": label or key, "section": self._section, "n": n, "step": step,
+            "t": thin(t) if t else None,
+            "series": {name: {"unit": unit, "values": thin(values)}
+                       for name, (values, unit) in series.items()},
+        }
+
     # -- results -----------------------------------------------------------
     def counts(self):
         c = {v: 0 for v in (PASS, FAIL, WARN, SKIP, INFO)}
@@ -101,7 +129,7 @@ class Report:
     def to_dict(self):
         return {"name": self.name, "started": self.started,
                 "duration_s": round(time.time() - self.started, 1),
-                "counts": self.counts(), "metrics": self.metrics,
+                "counts": self.counts(), "metrics": self.metrics, "raw": self.raw_series,
                 "entries": self.entries}
 
     def summary(self, prefix=""):

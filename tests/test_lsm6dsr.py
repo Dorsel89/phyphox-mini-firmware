@@ -234,6 +234,13 @@ async def run(dev, rep, args):
 
         acc_mg = decode_int16(acc, spec.LSM_ACC_MG_PER_LSB[REF_ACC_RANGE])
         gyr_dps = decode_int16(gyr, spec.LSM_GYR_MDPS_PER_LSB[REF_GYR_RANGE] / 1000.0)
+        # int16 packets carry one timestamp each, so these plot against the index
+        rep.raw("lsm.reference_acc",
+                {f"Acc {a.upper()}": ([s[a] for s in acc_mg], "mg") for a in "xyz"},
+                label=f"Beschleunigung in Ruhe ({spec.LSM_RATES[REF_RATE]:g} Hz)")
+        rep.raw("lsm.reference_gyr",
+                {f"Gyro {a.upper()}": ([s[a] for s in gyr_dps], "deg/s") for a in "xyz"},
+                label=f"Drehrate in Ruhe ({spec.LSM_RATES[REF_RATE]:g} Hz)")
 
         if len(acc_mg) < 50:
             rep.check("Referenzmessung Beschleunigung", False,

@@ -41,6 +41,9 @@ async def run(dev, rep, args):
         bad = [n for n in cap.lengths if n % SIZE]
         rep.check(f"Paketlaengen sind Vielfache von {SIZE} Byte",
                   not bad, f"Laengen {dict(cap.lengths)}")
+        rep.raw("bmp.basic", {"Druck": ([f["pressure"] for f in frames], "hPa"),
+                              "Temperatur": ([f["temperature"] for f in frames], "degC")},
+                t=[f["t"] for f in frames], label="BMP-Messwerte im Grundtest")
 
         st = cap.timestamp_stats(frames)
         rep.check("Zeitstempel streng aufsteigend", st and st["non_monotonic"] == 0,

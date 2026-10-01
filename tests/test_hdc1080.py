@@ -50,6 +50,8 @@ async def run(dev, rep, args):
 
         temps = [f["temperature"] for f in frames]
         hums = [f["humidity"] for f in frames]
+        rep.raw("hdc.basic", {"Temperatur": (temps, "degC"), "Feuchte": (hums, "%RH")},
+                t=[f["t"] for f in frames], label="HDC-Messwerte im Grundtest")
         dead = (all(t == DEAD_SENSOR[0] for t in temps)
                 and all(h == DEAD_SENSOR[1] for h in hums))
         rep.metric("hdc.alive", 0.0 if dead else 1.0,

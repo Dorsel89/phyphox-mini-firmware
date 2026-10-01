@@ -31,9 +31,20 @@ python run_all.py --board A19 --fast
 # nur einzelne Tests
 python run_all.py --board A19 --only lsm6dsr,datalog
 
+# alle phyphox:mini in Reichweite nacheinander, danach wird der HTML-Report erzeugt
+python run_all.py --all --fast
+python run_all.py --all --scan-seconds 90      # bei vielen Boards länger suchen
+
 # HTML-Auswertung über alle bisher gemessenen Boards und Zeitpunkte
 python make_report.py
 ```
+
+Mit `--all` sucht `run_all.py` selbst nach Boards (Standard 60 s) und testet sie
+**nacheinander**, nie gleichzeitig: Der Datalog-Test trennt die Verbindung
+absichtlich, und die LSM-Referenzmessung braucht ein ruhig liegendes Board. Geräte,
+die zwar so heißen, denen aber die phyphox:mini-Characteristics fehlen, werden
+übersprungen. Am Ende steht eine Gesamtübersicht je Board, und `results/report.html`
+wird neu erzeugt. Pro Board dauert es mit `--fast` etwa 3 Minuten, sonst etwa 10.
 
 Jedes Skript läuft auch allein:
 
